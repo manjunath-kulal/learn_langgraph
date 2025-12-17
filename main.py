@@ -9,7 +9,7 @@ from graph_nodes import (
     analyze_query, 
     retrieve_resumes, 
     grade_candidates, 
-    classify_intent_node, # We will define the wrapper in main.py or import it
+    classify_intent_node, 
     answer_follow_up_node
 )
 
@@ -37,12 +37,15 @@ def check_confidence(state):
         return "human_review"
     return "final_answer"
 
-# --- 3. TERMINAL NODES ---
+# --- 3. NODES ---
 def ask_clarification_node(state):
     return {"messages": [AIMessage(content="I need more details. What tech stack or seniority level are you looking for?")]}
 
+# NEW: This node now acts as the "Resume" point after human intervention
 def human_review_node(state):
-    return {"messages": [AIMessage(content="⚠️ LOW CONFIDENCE: Please review the analysis manually.")]}
+    # If we are here, it means the human has updated the state!
+    # We essentially "approved" the candidate or provided a manual override.
+    return {"messages": [AIMessage(content="✅ Human verified. Proceeding with this candidate.")]}
 
 def final_answer_node(state):
     candidate = state["selected_candidate"]
@@ -54,7 +57,6 @@ def final_answer_node(state):
 # --- 4. BUILD THE GRAPH ---
 workflow = StateGraph(RecruitmentState)
 
-# Add Nodes
 workflow.add_node("classify_intent", classify_intent_node)
 workflow.add_node("answer_follow_up", answer_follow_up_node)
 workflow.add_node("analyze_query", analyze_query)
@@ -64,74 +66,85 @@ workflow.add_node("grade_candidates", grade_candidates)
 workflow.add_node("human_review", human_review_node)
 workflow.add_node("final_answer", final_answer_node)
 
-# Set Entry Point
 workflow.set_entry_point("classify_intent")
 
-# Edges
-workflow.add_conditional_edges(
-    "classify_intent",
-    route_by_intent,
-    {
-        "FOLLOW_UP": "answer_follow_up",
-        "NEW_SEARCH": "analyze_query"
-    }
-)
+workflow.add_conditional_edges("classify_intent", route_by_intent, 
+    {"FOLLOW_UP": "answer_follow_up", "NEW_SEARCH": "analyze_query"})
 
-workflow.add_conditional_edges(
-    "analyze_query",
-    decide_next_step,
-    {
-        "ask_clarification": "ask_clarification",
-        "retrieve_resumes": "retrieve_resumes"
-    }
-)
+workflow.add_conditional_edges("analyze_query", decide_next_step, 
+    {"ask_clarification": "ask_clarification", "retrieve_resumes": "retrieve_resumes"})
 
 workflow.add_edge("retrieve_resumes", "grade_candidates")
 
-workflow.add_conditional_edges(
-    "grade_candidates",
-    check_confidence,
-    {
-        "human_review": "human_review",
-        "final_answer": "final_answer"
-    }
-)
+workflow.add_conditional_edges("grade_candidates", check_confidence, 
+    {"human_review": "human_review", "final_answer": "final_answer"})
 
 workflow.add_edge("answer_follow_up", END)
 workflow.add_edge("ask_clarification", END)
-workflow.add_edge("human_review", END)
 workflow.add_edge("final_answer", END)
+workflow.add_edge("human_review", END) # After review, we end (or could loop back)
 
-# --- 5. COMPILE WITH CHECKPOINTER (Your Fix) ---
-# MemorySaver acts as the InMemorySaver to persist state across turns
+# --- 5. COMPILE WITH INTERRUPT ---
 checkpointer = MemorySaver()
-app = workflow.compile(checkpointer=checkpointer)
 
-# --- 6. RUN APP ---
+# 🔥 CRITICAL CHANGE: We interrupt BEFORE 'human_review' runs.
+app = workflow.compile(
+    checkpointer=checkpointer, 
+    interrupt_before=["human_review"] 
+)
+
+# --- 6. RUN APP (INTERACTIVE LOOP) ---
 if __name__ == "__main__":
-    print("🤖 Stateful Recruitment Agent Ready. (Type 'quit' to exit)")
-    
-    # We use a static thread_id to simulate a continuous session
+    print("🤖 HITL Recruitment Agent Ready. (Type 'quit' to exit)")
     config = {"configurable": {"thread_id": "session_1"}}
 
     while True:
         try:
+            # 1. Check if we are currently paused (Waiting for Human)
+            current_state = app.get_state(config)
+            
+            # If the next step is 'human_review', we are PAUSED.
+            if current_state.next and current_state.next[0] == "human_review":
+                print("\n⚠️  LOW CONFIDENCE DETECTED.")
+                print("The agent is unsure. It wants to proceed to 'human_review'.")
+                user_action = input("Type 'ok' to approve the candidate, or 'override' to reject: ")
+                
+                if user_action.lower() == "ok":
+                    # We resume execution (NULL input acts as "continue")
+                    print("👍 Approving...")
+                    # Update confidence manually so we don't loop forever if we changed logic
+                    app.update_state(config, {"confidence": "HIGH"}) 
+                    
+                    # Resume graph!
+                    for event in app.stream(None, config=config):
+                        for key, value in event.items():
+                             print(f"   ↳ {key}...")
+                             if "messages" in value: print(f"🤖 Agent: {value['messages'][-1].content}")
+                             
+                else:
+                    print("❌ Rejected. Cancelling this search.")
+                    # We can just break or reset here. For now, let's just wait for new input.
+                    pass
+                
+                continue # Skip the normal input loop
+
+            # 2. Normal Operation (Not Paused)
             user_input = input("\nHR User: ")
             if user_input.lower() in ["quit", "exit"]:
                 break
             
-            # The checkpointer will now automatically load the state from 'session_1'
             inputs = {"messages": [HumanMessage(content=user_input)]}
             
             for event in app.stream(inputs, config=config):
                 for key, value in event.items():
-                    if key in ["final_answer", "answer_follow_up", "ask_clarification"]:
+                    if key == "human_review":
+                        # This won't print because we interrupt BEFORE it runs!
+                        pass 
+                    elif key in ["final_answer", "answer_follow_up", "ask_clarification"]:
                         print(f"\n🤖 Agent: {value['messages'][-1].content}")
-                    elif key == "human_review":
-                        print(f"\n⚠️ {value['messages'][-1].content}")
                     else:
                         print(f"   ↳ {key}...")
-                        
+
         except KeyboardInterrupt:
             print("\nExiting...")
             break

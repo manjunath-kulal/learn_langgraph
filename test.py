@@ -14,7 +14,7 @@ client = genai.Client(api_key=api_key)
 
 def test_prompt():
     response = client.models.generate_content(
-        model="models/gemini-2.5-flash-lite",
+        model="models/gemini-2.5-flash",
         contents="Explain what FAISS is in one sentence."
     )
 
