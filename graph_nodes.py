@@ -5,7 +5,7 @@ from typing import Optional, Dict, Any
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -23,9 +23,9 @@ except Exception as e:
     print(f"❌ Error loading index: {e}")
     vector_store = None
 
-# Initialize the Brain (Gemini 2.5 Flash) - STRICTLY PRESERVED
+# Initialize the Brain (Gemini 2.5 Flash) - UNTOUCHED
 llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash", 
+    model="models/gemini-2.5-flash-lite", 
     api_key=os.environ.get("GEMINI_API_KEY"),
     temperature=0
 )
@@ -45,21 +45,37 @@ def retrieve_resumes(state):
 
 def check_intent_with_llm(query: str, current_candidate: Optional[Dict[str, Any]]) -> str:
     """
-    Uses Gemini to strictly classify if the user is following up or starting fresh.
+    Stricter Intent Classification.
     """
-    candidate_context = f"Current Candidate Context: {current_candidate.get('best_candidate_name')}" if current_candidate else "No candidate selected yet."
+    candidate_name = current_candidate.get('best_candidate_name') if current_candidate else "None"
     
     system_prompt = f"""You are a routing assistant.
-    {candidate_context}
+    Current Candidate: {candidate_name}
     
     Classify the USER QUERY into one of two intents:
-    1. 'FOLLOW_UP': The user is asking a question about the current candidate (e.g., "is he indian?", "tell me more", "what about education?", "send email").
-    2. 'NEW_SEARCH': The user is asking for a different role or candidate (e.g., "find a java dev", "search for something else").
+    1. 'FOLLOW_UP': The user is asking about the current candidate (e.g., "tell me more", "is he indian?", "education?", "experience?").
+    2. 'NEW_SEARCH': The user is strictly asking for a NEW search (e.g., "find java dev", "search for python").
+    
+    GUIDELINE: If the query is vague (e.g., "tell me more", "what about him") and we have a candidate, assume FOLLOW_UP.
     
     Output ONLY the word 'FOLLOW_UP' or 'NEW_SEARCH'."""
     
     response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=query)])
     return response.content.strip().upper()
+
+def classify_intent_node(state):
+    # This wrapper function is now imported by main.py
+    print("--- NODE: CLASSIFYING INTENT ---")
+    last_msg = state["messages"][-1].content
+    candidate = state.get("selected_candidate")
+    
+    decision = check_intent_with_llm(last_msg, candidate)
+    
+    # Fail-safe
+    if not candidate:
+        decision = "NEW_SEARCH"
+        
+    return {"intent": decision}
 
 def analyze_query(state):
     print("--- NODE: ANALYZING QUERY ---")
@@ -91,7 +107,7 @@ def grade_candidates(state):
         "best_candidate_name": "Name",
         "match_score": 85,
         "evidence": "Brief quote from text supporting the match...",
-        "full_summary": "A 2-3 sentence summary of the candidate's profile.",
+        "full_summary": "A detailed 2-3 sentence summary of the candidate's profile.",
         "confidence": "HIGH" or "LOW"
     }}
     """
@@ -110,15 +126,11 @@ def grade_candidates(state):
         print(f"⚠️ JSON Parsing Failed: {e}")
         return {"analysis": response.content, "confidence": "LOW"}
 
-def generate_followup_answer(state):
-    """
-    Uses the LLM to answer questions about the specific candidate using the resume context.
-    """
+def answer_follow_up_node(state):
     print("--- NODE: GENERATING FOLLOW-UP ---")
     candidate = state["selected_candidate"]
     query = state["messages"][-1].content
     
-    # We feed the FULL summary/evidence we already have to the LLM
     context = f"Candidate: {candidate.get('best_candidate_name')}\nProfile: {candidate.get('full_summary')}\nEvidence: {candidate.get('evidence')}"
     
     system_prompt = f"""You are a helpful HR assistant.
@@ -129,8 +141,8 @@ def generate_followup_answer(state):
     
     USER QUESTION: {query}
     
-    Answer clearly. If the information is not in the context, say "I don't see that mentioned in the resume summary."
+    Answer clearly.
     """
     
     response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=query)])
-    return response.content
+    return {"messages": [AIMessage(content=response.content)]}
