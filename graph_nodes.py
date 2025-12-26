@@ -2,6 +2,7 @@ import os
 import json
 import re
 import time
+import logging
 from typing import Optional, Dict, Any
 from functools import wraps
 
@@ -13,37 +14,96 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from dotenv import load_dotenv
 load_dotenv()
 
-# --- 1. RATE LIMITER ---
-class RateLimiter:
-    def __init__(self, max_calls_per_minute=10):
-        self.interval = 60.0 / max_calls_per_minute
-        self.last_call_time = 0
+# --- 1. LOGGING CONFIGURATION (TRUE LOGGING) ---
+# This sets up a logger that writes to both 'agent.log' and the terminal
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler("agent.log", mode='a'), # Append mode
+        logging.StreamHandler() # Console output
+    ]
+)
+logger = logging.getLogger("RecruitmentAgent")
 
-    def wait(self):
-        elapsed = time.time() - self.last_call_time
+# --- 2. PERSISTENT RATE LIMITER ---
+class PersistentRateLimiter:
+    """
+    A Rate Limiter that remembers usage across script restarts 
+    by saving the last call timestamp to a local file.
+    """
+    def __init__(self, state_file=".limiter_state", max_calls_per_min=10):
+        self.state_file = os.path.join(os.path.dirname(__file__), state_file)
+        self.interval = 60.0 / max_calls_per_min
+
+    def wait_for_token(self):
+        last_call = 0.0
+        if os.path.exists(self.state_file):
+            try:
+                with open(self.state_file, "r") as f:
+                    content = f.read().strip()
+                    if content:
+                        last_call = float(content)
+            except Exception:
+                pass 
+
+        now = time.time()
+        elapsed = now - last_call
+        
         if elapsed < self.interval:
-            time.sleep(self.interval - elapsed)
-        self.last_call_time = time.time()
+            sleep_time = self.interval - elapsed
+            logger.warning(f"⏳ Rate Limit (Proactive): Pausing for {sleep_time:.2f}s...")
+            time.sleep(sleep_time)
 
-limiter = RateLimiter(max_calls_per_minute=15)
+        try:
+            with open(self.state_file, "w") as f:
+                f.write(str(time.time()))
+        except Exception:
+            pass
 
-def rate_limit(func):
+limiter = PersistentRateLimiter(max_calls_per_min=10)
+
+def safe_llm_call(func):
+    """
+    Hybrid Decorator: Proactive Wait + Reactive Retry
+    """
     @wraps(func)
     def wrapper(*args, **kwargs):
-        limiter.wait()
-        return func(*args, **kwargs)
+        # Proactive Step
+        limiter.wait_for_token() 
+        
+        # Reactive Step
+        retries = 3
+        base_delay = 30 
+        for attempt in range(retries):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                error_str = str(e)
+                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                    logger.warning(f"🛑 API QUOTA HIT (Attempt {attempt+1}/{retries}). Sleeping {base_delay}s...")
+                    time.sleep(base_delay)
+                    base_delay += 10 
+                    limiter.wait_for_token() # Update state after wake
+                else:
+                    logger.error(f"❌ LLM Call Failed: {e}")
+                    raise e
+        
+        logger.critical("Failed after max retries due to API Quota.")
+        raise Exception("Failed after max retries due to API Quota.")
     return wrapper
 
-# --- 2. SETUP ---
+# --- 3. SETUP ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 INDEX_PATH = os.path.join(BASE_DIR, "resume_index")
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 try:
     vector_store = FAISS.load_local(INDEX_PATH, embeddings, allow_dangerous_deserialization=True)
-    print("✅ FAISS Index Loaded.")
+    logger.info("✅ FAISS Index Loaded Successfully.")
 except Exception as e:
-    print(f"❌ Error loading index: {e}")
+    logger.critical(f"❌ Error loading index: {e}")
     vector_store = None
 
 llm = ChatGoogleGenerativeAI(
@@ -52,41 +112,39 @@ llm = ChatGoogleGenerativeAI(
     temperature=0
 )
 
-# --- 3. ROBUST JSON EXTRACTOR (The Fix) ---
+# --- 4. ROBUST JSON EXTRACTOR ---
 def extract_json(text):
-    """
-    Finds the first valid JSON object in a string, ignoring surrounding text.
-    """
     try:
-        # 1. Try standard cleaning first
         clean_text = re.sub(r"```json\s*|```", "", text).strip()
         return json.loads(clean_text)
-    except json.JSONDecodeError:
-        pass
-
-    # 2. Regex search for { ... }
-    # This pattern finds the first '{' and the last '}' 
+    except json.JSONDecodeError: pass
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
-        json_str = match.group(0)
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError:
-            pass
-            
+        try: return json.loads(match.group(0))
+        except: pass
+    logger.error("JSON Extraction Failed: No valid JSON found in response.")
     raise ValueError("No valid JSON found in response")
 
-# --- 4. NODE FUNCTIONS ---
+# --- 5. NODE FUNCTIONS (With True Logging) ---
 
 def retrieve_resumes(state):
-    print("--- NODE: RETRIEVING RESUMES ---")
+    logger.info("--- NODE ENTRY: retrieve_resumes (Broad Search) ---")
     query = state["messages"][-1].content
     docs = vector_store.similarity_search(query, k=5)
     context_text = "\n---\n".join([d.page_content for d in docs])
     return {"retrieved_docs": context_text}
 
-@rate_limit
+def fetch_candidate_details(state):
+    logger.info("--- NODE ENTRY: fetch_candidate_details (Deep Dive) ---")
+    candidate = state["selected_candidate"]
+    name = candidate.get("best_candidate_name", "")
+    docs = vector_store.similarity_search(name, k=10)
+    context_text = "\n---\n".join([d.page_content for d in docs])
+    return {"retrieved_docs": context_text}
+
+@safe_llm_call
 def check_intent_with_llm(query: str, current_candidate: Optional[Dict[str, Any]]) -> str:
+    logger.info(f"LLM CALL: check_intent_with_llm | Query: {query[:50]}...")
     candidate_name = current_candidate.get('best_candidate_name') if current_candidate else "None"
     system_prompt = f"""You are a routing assistant.
     Current Candidate: {candidate_name}
@@ -96,24 +154,27 @@ def check_intent_with_llm(query: str, current_candidate: Optional[Dict[str, Any]
     return response.content.strip().upper()
 
 def classify_intent_node(state):
-    print("--- NODE: CLASSIFYING INTENT ---")
+    logger.info("--- NODE ENTRY: classify_intent_node ---")
     last_msg = state["messages"][-1].content
     candidate = state.get("selected_candidate")
     decision = check_intent_with_llm(last_msg, candidate)
     if not candidate: decision = "NEW_SEARCH"
+    logger.info(f"Intent Decision: {decision}")
     return {"intent": decision}
 
-@rate_limit
+@safe_llm_call
 def analyze_query(state):
-    print("--- NODE: ANALYZING QUERY ---")
+    logger.info("--- NODE ENTRY: analyze_query ---")
+    logger.info("LLM CALL: analyze_query")
     query = state["messages"][-1].content
     system_prompt = """Analyze request. Return 'CLARIFY' if vague (no skills/role), else 'SEARCH'."""
     response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=query)])
     return {"is_clarification_needed": (response.content.strip().upper() == "CLARIFY")}
 
-@rate_limit
+@safe_llm_call
 def grade_candidates(state):
-    print("--- NODE: GRADING CANDIDATES ---")
+    logger.info("--- NODE ENTRY: grade_candidates ---")
+    logger.info("LLM CALL: grade_candidates")
     query = state["messages"][-1].content
     docs = state["retrieved_docs"]
     
@@ -131,41 +192,43 @@ def grade_candidates(state):
         "confidence": "HIGH" or "LOW"
     }}
     """
-    
     response = llm.invoke([HumanMessage(content=system_prompt)])
     
     try:
-        # USE THE NEW ROBUST EXTRACTOR
         analysis_dict = extract_json(response.content)
-        
         return {
             "analysis": response.content,
             "selected_candidate": analysis_dict, 
             "confidence": analysis_dict.get("confidence", "HIGH")
         }
     except Exception as e:
-        print(f"⚠️ JSON Parsing Failed: {e}")
-        print(f"DEBUG: Raw content was: {response.content[:100]}...") # Print preview for debugging
-        
-        # Fallback that allows human to read the raw text
+        logger.error(f"JSON Parsing Failed: {e}")
+        logger.debug(f"Raw Content: {response.content[:200]}...") # Debug level for raw content
         return {
             "analysis": response.content,
             "confidence": "LOW",
             "selected_candidate": {
-                "best_candidate_name": "Parsing Error (See Evidence)",
+                "best_candidate_name": "Parsing Error",
                 "match_score": 0,
-                # Store the RAW text here so the human can see it in final answer
                 "evidence": f"RAW OUTPUT: {response.content}", 
                 "full_summary": "The AI response could not be converted to JSON."
             }
         }
 
-@rate_limit
+@safe_llm_call
 def answer_follow_up_node(state):
-    print("--- NODE: GENERATING FOLLOW-UP ---")
+    logger.info("--- NODE ENTRY: answer_follow_up_node ---")
+    logger.info("LLM CALL: answer_follow_up_node")
     candidate = state["selected_candidate"]
     query = state["messages"][-1].content
-    context = f"Candidate: {candidate.get('best_candidate_name')}\nProfile: {candidate.get('full_summary')}\nEvidence: {candidate.get('evidence')}"
-    system_prompt = f"Answer user question based ONLY on this context:\n{context}"
+    full_context = state["retrieved_docs"]
+    
+    system_prompt = f"""You are a helpful HR assistant.
+    You are answering a question about {candidate.get('best_candidate_name')}.
+    FULL RESUME CONTEXT:
+    {full_context}
+    USER QUESTION: {query}
+    Answer specific details (Education, Skills, Hobbies) found in the context.
+    """
     response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=query)])
     return {"messages": [AIMessage(content=response.content)]}

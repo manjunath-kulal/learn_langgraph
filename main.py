@@ -10,11 +10,13 @@ from graph_nodes import (
     retrieve_resumes, 
     grade_candidates, 
     classify_intent_node, 
-    answer_follow_up_node
+    answer_follow_up_node,
+    fetch_candidate_details 
 )
 
 # --- 1. DEFINE STATE ---
 class RecruitmentState(TypedDict):
+    # 'messages' uses operator.add to append history instead of overwriting
     messages: Annotated[List[BaseMessage], operator.add]
     retrieved_docs: str
     selected_candidate: Optional[Dict[str, Any]] 
@@ -41,11 +43,9 @@ def check_confidence(state):
 def ask_clarification_node(state):
     return {"messages": [AIMessage(content="I need more details. What tech stack or seniority level are you looking for?")]}
 
-# NEW: This node now acts as the "Resume" point after human intervention
 def human_review_node(state):
-    # If we are here, it means the human has updated the state!
-    # We essentially "approved" the candidate or provided a manual override.
-    return {"messages": [AIMessage(content="✅ Human verified. Proceeding with this candidate.")]}
+    # This runs immediately AFTER the human types "ok" and resumes execution.
+    return {"messages": [AIMessage(content="✅ Human verified. Proceeding with this candidate...")]}
 
 def final_answer_node(state):
     candidate = state["selected_candidate"]
@@ -57,7 +57,9 @@ def final_answer_node(state):
 # --- 4. BUILD THE GRAPH ---
 workflow = StateGraph(RecruitmentState)
 
+# Add Nodes
 workflow.add_node("classify_intent", classify_intent_node)
+workflow.add_node("fetch_candidate_details", fetch_candidate_details)
 workflow.add_node("answer_follow_up", answer_follow_up_node)
 workflow.add_node("analyze_query", analyze_query)
 workflow.add_node("ask_clarification", ask_clarification_node)
@@ -66,72 +68,83 @@ workflow.add_node("grade_candidates", grade_candidates)
 workflow.add_node("human_review", human_review_node)
 workflow.add_node("final_answer", final_answer_node)
 
+# Set Entry Point
 workflow.set_entry_point("classify_intent")
 
+# Edge 1: Intent Routing
 workflow.add_conditional_edges("classify_intent", route_by_intent, 
-    {"FOLLOW_UP": "answer_follow_up", "NEW_SEARCH": "analyze_query"})
+    {"FOLLOW_UP": "fetch_candidate_details", "NEW_SEARCH": "analyze_query"})
 
+# Edge 2: Deep Dive Flow
+workflow.add_edge("fetch_candidate_details", "answer_follow_up")
+
+# Edge 3: Standard Search Flow
 workflow.add_conditional_edges("analyze_query", decide_next_step, 
     {"ask_clarification": "ask_clarification", "retrieve_resumes": "retrieve_resumes"})
 
 workflow.add_edge("retrieve_resumes", "grade_candidates")
 
+# Edge 4: Confidence Check (The HITL Fork)
 workflow.add_conditional_edges("grade_candidates", check_confidence, 
     {"human_review": "human_review", "final_answer": "final_answer"})
 
+# 🔥 CRITICAL FIX: Connect Human Review -> Final Answer
+# This ensures that after you say "ok", the agent actually SHOWS you the candidate.
+workflow.add_edge("human_review", "final_answer")
+
+# Terminals
 workflow.add_edge("answer_follow_up", END)
 workflow.add_edge("ask_clarification", END)
 workflow.add_edge("final_answer", END)
-workflow.add_edge("human_review", END) # After review, we end (or could loop back)
 
-# --- 5. COMPILE WITH INTERRUPT ---
+# --- 5. COMPILE WITH PERSISTENCE & INTERRUPT ---
 checkpointer = MemorySaver()
 
-# 🔥 CRITICAL CHANGE: We interrupt BEFORE 'human_review' runs.
 app = workflow.compile(
     checkpointer=checkpointer, 
-    interrupt_before=["human_review"] 
+    interrupt_before=["human_review"] # The graph PAUSES right before entering this node
 )
 
 # --- 6. RUN APP (INTERACTIVE LOOP) ---
 if __name__ == "__main__":
     print("🤖 HITL Recruitment Agent Ready. (Type 'quit' to exit)")
+    
+    # Config is REQUIRED for persistence to work (identifies the session)
     config = {"configurable": {"thread_id": "session_1"}}
 
     while True:
         try:
-            # 1. Check if we are currently paused (Waiting for Human)
+            # 1. CHECK INTERRUPT STATE (Are we paused?)
             current_state = app.get_state(config)
             
-            # If the next step is 'human_review', we are PAUSED.
+            # If the next node is 'human_review', the graph is currently FROZEN.
             if current_state.next and current_state.next[0] == "human_review":
                 print("\n⚠️  LOW CONFIDENCE DETECTED.")
-                print("The agent is unsure. It wants to proceed to 'human_review'.")
-                user_action = input("Type 'ok' to approve the candidate, or 'override' to reject: ")
+                print("   The agent is unsure. It has paused for your review.")
+                user_action = input("   Type 'ok' to approve, or 'override' to reject: ")
                 
                 if user_action.lower() == "ok":
-                    # We resume execution (NULL input acts as "continue")
                     print("👍 Approving...")
-                    # Update confidence manually so we don't loop forever if we changed logic
+                    
+                    # STATE UPDATE: We manually override the confidence in the agent's memory
                     app.update_state(config, {"confidence": "HIGH"}) 
                     
-                    # Resume graph!
+                    # RESUME: Passing None tells LangGraph to "continue execution"
                     for event in app.stream(None, config=config):
                         for key, value in event.items():
-                             print(f"   ↳ {key}...")
                              if "messages" in value: print(f"🤖 Agent: {value['messages'][-1].content}")
                              
                 else:
-                    print("❌ Rejected. Cancelling this search.")
-                    # We can just break or reset here. For now, let's just wait for new input.
+                    print("❌ Rejected. Resetting search.")
+                    # In a real app, you might clear state here. 
+                    # For now, we just loop back to let the user type a new query.
                     pass
                 
-                continue # Skip the normal input loop
+                continue # Skip the normal input prompt, loop back to start
 
-            # 2. Normal Operation (Not Paused)
+            # 2. NORMAL CHAT LOOP
             user_input = input("\nHR User: ")
-            if user_input.lower() in ["quit", "exit"]:
-                break
+            if user_input.lower() in ["quit", "exit"]: break
             
             inputs = {"messages": [HumanMessage(content=user_input)]}
             
